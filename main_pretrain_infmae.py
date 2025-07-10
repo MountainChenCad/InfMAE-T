@@ -14,9 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 # Removed: import torchvision.datasets as datasets
 import timm
-
-assert timm.__version__ == "0.3.2"
-import timm.optim.optim_factory as optim_factory
+from timm.optim import create_optimizer_v2
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -56,7 +54,7 @@ def get_args_parser():
     parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N', help='epochs to warmup LR')
 
     # *** MODIFIED: Dataset parameters ***
-    parser.add_argument('--data_path', default='./Dataset', type=str,
+    parser.add_argument('--data_path', default='../InfAIM/dataset', type=str,
                         help='Root path to dataset (containing scene_1, scene_2, etc.)')
 
     parser.add_argument('--output_dir', default='./output_inf_videomae', help='path where to save, empty for no saving')
@@ -80,6 +78,8 @@ def get_args_parser():
     return parser
 
 
+# In main_pretrain_infmae.py
+
 def main(args):
     misc.init_distributed_mode(args)
 
@@ -88,9 +88,17 @@ def main(args):
 
     device = torch.device(args.device)
 
-    seed = args.seed + misc.get_rank()
+    # --- FIX STARTS HERE ---
+    # Get the rank of the process. This will be 0 for non-distributed training.
+    global_rank = misc.get_rank()
+
+    # Set seed based on the rank to ensure different initializations for each process
+    seed = args.seed + global_rank
+    # --- FIX ENDS HERE ---
+
     torch.manual_seed(seed)
     np.random.seed(seed)
+
     cudnn.benchmark = True
 
     # simple data augmentation
@@ -100,7 +108,7 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.425, 0.425, 0.425], std=[0.200, 0.200, 0.200])])
 
-    # *** MODIFIED: Use the new VideoMAEPretrainDataset ***
+    # Use the new VideoMAEPretrainDataset
     scene_folders = ['scene_1', 'scene_2', 'scene_3']
     dataset_train = VideoMAEPretrainDataset(
         data_root=args.data_path,
@@ -112,13 +120,15 @@ def main(args):
 
     if args.distributed:
         num_tasks = misc.get_world_size()
-        global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(dataset_train, num_replicas=num_tasks, rank=global_rank,
-                                                            shuffle=True)
+        # global_rank is already defined
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
         print("Sampler_train = %s" % str(sampler_train))
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
+    # Now this check will work correctly in both modes
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
@@ -133,7 +143,7 @@ def main(args):
         drop_last=True,
     )
 
-    # *** MODIFIED: Pass clip_length to the model ***
+    # Pass clip_length to the model
     model = models_infmae_skip4.__dict__[args.model](
         norm_pix_loss=args.norm_pix_loss,
         clip_length=args.clip_length
@@ -155,8 +165,8 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
-    param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = create_optimizer_v2(model_without_ddp, opt='adamw', lr=args.lr, weight_decay=args.weight_decay,
+                                    betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
@@ -167,13 +177,15 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        # In our case, the dataset returns (data, dummy_label)
+        # We need to adapt the train_one_epoch call if it expects a label
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):  # Save more frequently
+        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)

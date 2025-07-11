@@ -131,7 +131,7 @@ class MaskedAutoencoderInfMAE(nn.Module):
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
 
-        return x_masked, mask, ids_restore
+        return x_masked, mask, ids_restore, ids_keep
 
     def forward_encoder(self, x, mask_ratio):
         B, T, C, H, W = x.shape
@@ -154,7 +154,7 @@ class MaskedAutoencoderInfMAE(nn.Module):
         x = x + self.pos_embed.unsqueeze(1) + self.temporal_pos_embed
 
         # *** MODIFIED: Apply tube masking ***
-        x, mask, ids_restore = self.random_masking_tube(x, mask_ratio)
+        x, mask, ids_restore, ids_keep = self.random_masking_tube(x, mask_ratio)
         x = x.view(B * T, -1, x.shape[-1])
 
         # Also gather the skip connections based on the spatial mask
@@ -191,7 +191,7 @@ class MaskedAutoencoderInfMAE(nn.Module):
             [x.view(B, self.clip_length, -1, D), mask_tokens.unsqueeze(1).expand(-1, self.clip_length, -1, -1)], dim=2)
         x_restored = torch.gather(x_restored, dim=2,
                                   index=ids_restore.unsqueeze(1).unsqueeze(-1).expand(-1, self.clip_length, -1, D))
-        x = x_restored.view(B * T, self.num_patches, D)
+        x = x_restored.view(B * self.clip_length, self.num_patches, D)
 
         x = x + self.decoder_pos_embed
 

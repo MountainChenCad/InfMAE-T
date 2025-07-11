@@ -14,7 +14,6 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 # Removed: import torchvision.datasets as datasets
 import timm
-from timm.optim import create_optimizer_v2
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
@@ -165,8 +164,8 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
-    optimizer = create_optimizer_v2(model_without_ddp, opt='adamw', lr=args.lr, weight_decay=args.weight_decay,
-                                    betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                                  betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 

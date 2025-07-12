@@ -1,9 +1,5 @@
-# References:
-# timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
-# DeiT: https://github.com/facebookresearch/deit
-# MAE: https://github.com/facebookresearch/mae
-# MCMAE：https://github.com/Alpha-VL/ConvMAE/tree/main
-# --------------------------------------------------------
+# engine_pretraining.py
+
 import math
 import sys
 from typing import Iterable
@@ -23,18 +19,20 @@ def train_one_epoch(model: torch.nn.Module,
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 20
+
+    # --- 修复：添加进度条 ---
+    total_batches = len(data_loader)
+    # --- 修复结束 ---
 
     accum_iter = args.accum_iter
-
     optimizer.zero_grad()
 
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-
-        # we use a per iteration (instead of per epoch) lr scheduler
+    # --- 修复：修改循环以手动控制打印 ---
+    for data_iter_step, (samples, _) in enumerate(data_loader):
+        # --- 修复结束 ---
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
@@ -58,21 +56,25 @@ def train_one_epoch(model: torch.nn.Module,
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
-
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
-        if log_writer is not None and (data_iter_step + 1) % accum_iter == 0:
-            """ We use epoch_1000x as the x-axis in tensorboard.
-            This calibrates different curves when batch size changes.
-            """
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('lr', lr, epoch_1000x)
+        # --- 修复：打印实时进度条 ---
+        percent = 100. * (data_iter_step + 1) / total_batches
+        bar_length = 40
+        filled_len = int(bar_length * (data_iter_step + 1) // total_batches)
+        bar = '█' * filled_len + '-' * (bar_length - filled_len)
 
+        avg_loss = metric_logger.loss.avg
 
-    # gather the stats from all processes
+        # 使用 \r 实现单行刷新
+        print(
+            f'\r{header} |{bar}| {percent:.1f}% [{data_iter_step + 1}/{total_batches}] - Avg Loss: {avg_loss:.4f} - LR: {lr:.6f}',
+            end='')
+        if data_iter_step + 1 == total_batches:
+            print()  # 在 epoch 结束时换行
+        # --- 修复结束 ---
+
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

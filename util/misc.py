@@ -1,13 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# DeiT: https://github.com/facebookresearch/deit
-# BEiT: https://github.com/microsoft/unilm/tree/master/beit
-# --------------------------------------------------------
+# util/misc.py
 
 import builtins
 import datetime
@@ -18,7 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from math import inf
+from torch import inf
 
 
 class SmoothedValue(object):
@@ -178,8 +169,7 @@ def setup_for_distributed(is_master):
         force = force or (get_world_size() > 8)
         if is_master or force:
             now = datetime.datetime.now().time()
-            builtin_print('[{}] '.format(now), end='')  # print with time stamp
-            builtin_print(*args, **kwargs)
+            builtin_print('[{}]'.format(now), *args, **kwargs)
 
     builtins.print = print
 
@@ -211,6 +201,23 @@ def is_main_process():
 def save_on_master(*args, **kwargs):
     if is_main_process():
         torch.save(*args, **kwargs)
+
+
+def all_reduce_mean(tensor):
+    """All-reduce the provided tensor across all processes and return the mean."""
+    if not is_dist_avail_and_initialized():
+        return tensor
+
+    # Clone tensor to avoid in-place operations
+    tensor = tensor.clone()
+
+    # All-reduce the tensor
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+    # Divide by world size to get mean
+    tensor = tensor / get_world_size()
+
+    return tensor
 
 
 def init_distributed_mode(args):
@@ -288,60 +295,59 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     if norm_type == inf:
         total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
     else:
-        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
+        total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]),
+                                norm_type)
     return total_norm
 
 
-def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler, filename=None):
+    """Save model checkpoint with safe format."""
     output_dir = Path(args.output_dir)
-    epoch_name = str(epoch)
-    if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('checkpoint-%s.pth' % epoch_name)]
-        for checkpoint_path in checkpoint_paths:
-            to_save = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'scaler': loss_scaler.state_dict(),
-                'args': args,
-            }
+    if filename is None:
+        epoch_name = str(epoch)
+        filename = f'checkpoint-{epoch_name}.pth'
 
-            save_on_master(to_save, checkpoint_path)
-    else:
-        client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+    checkpoint_path = output_dir / filename
 
+    # 创建安全的checkpoint，只保存必要的信息
+    to_save = {
+        'model': model_without_ddp.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': epoch,
+        'scaler': loss_scaler.state_dict(),
+        # 只保存args的关键信息，避免序列化问题
+        'args': {
+            'model': args.model,
+            'input_size': args.input_size,
+            'mask_ratio': args.mask_ratio,
+            'norm_pix_loss': args.norm_pix_loss,
+            'clip_length': args.clip_length,
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+            'batch_size': args.batch_size,
+        }
+    }
 
-def save_best_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
-    output_dir = Path(args.output_dir)
-    epoch_name = str(epoch)
-    if loss_scaler is not None:
-        checkpoint_paths = [output_dir / 'best_checkpoint.pth']
-        for checkpoint_path in checkpoint_paths:
-            to_save = {
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
-                'scaler': loss_scaler.state_dict(),
-                'args': args,
-            }
-
-            save_on_master(to_save, checkpoint_path)
-    else:
-        client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
+    save_on_master(to_save, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
+    """Load model checkpoint with safe format."""
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            # 修复：设置weights_only=False来加载包含args的checkpoint
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+
+        # 加载模型状态
         model_without_ddp.load_state_dict(checkpoint['model'])
         print("Resume checkpoint %s" % args.resume)
-        if 'optimizer' in checkpoint and 'epoch' in checkpoint and not (hasattr(args, 'eval') and args.eval):
+
+        # 加载优化器状态
+        if 'optimizer' in checkpoint and 'lr' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
             if 'scaler' in checkpoint:
@@ -349,12 +355,26 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
             print("With optim & sched!")
 
 
-def all_reduce_mean(x):
-    world_size = get_world_size()
-    if world_size > 1:
-        x_reduce = torch.tensor(x).cuda()
-        dist.all_reduce(x_reduce)
-        x_reduce /= world_size
-        return x_reduce.item()
-    else:
-        return x
+def interpolate_pos_embed(model, checkpoint_model):
+    """Interpolate position embeddings for resolution changes."""
+    if 'pos_embed' in checkpoint_model:
+        pos_embed_checkpoint = checkpoint_model['pos_embed']
+        embedding_size = pos_embed_checkpoint.shape[-1]
+        num_patches = model.patch_embed.num_patches
+        num_extra_tokens = model.pos_embed.shape[-2] - num_patches
+        # height (== width) for the checkpoint position embedding
+        orig_size = int(((pos_embed_checkpoint.shape[-2] - num_extra_tokens) // 1) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int((num_patches // 1) ** 0.5)
+        # class_token and dist_token are kept unchanged
+        if orig_size != new_size:
+            print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+            extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
+            # only the position tokens are interpolated
+            pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
+            pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, embedding_size).permute(0, 3, 1, 2)
+            pos_tokens = torch.nn.functional.interpolate(
+                pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+            pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+            new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+            checkpoint_model['pos_embed'] = new_pos_embed

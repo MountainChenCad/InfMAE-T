@@ -12,15 +12,15 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-# Removed: import torchvision.datasets as datasets
 import timm
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
-# *** NEW: Import the new video dataset class ***
 from util.video_pretrain_dataset import VideoMAEPretrainDataset
+from util.video_detection_dataset import VideoDetectionDataset, detection_collate_fn
 import models_infmae_skip4
 from engine_pretrain import train_one_epoch
+from validation import run_validation_epoch
 
 
 def get_args_parser():
@@ -40,7 +40,7 @@ def get_args_parser():
                         help='Use (per-patch) normalized pixels as targets for computing loss')
     parser.set_defaults(norm_pix_loss=False)
 
-    # *** NEW: Video specific parameters ***
+    # Video specific parameters
     parser.add_argument('--clip_length', type=int, default=16, help='Number of frames in each video clip')
 
     # Optimizer parameters
@@ -52,9 +52,16 @@ def get_args_parser():
                         help='lower lr bound for cyclic schedulers that hit 0')
     parser.add_argument('--warmup_epochs', type=int, default=40, metavar='N', help='epochs to warmup LR')
 
-    # *** MODIFIED: Dataset parameters ***
+    # Dataset parameters
     parser.add_argument('--data_path', default='../InfAIM/dataset', type=str,
                         help='Root path to dataset (containing scene_1, scene_2, etc.)')
+    parser.add_argument('--data_ratio', type=float, default=1.0,
+                        help='Ratio of training data to use (0.0-1.0)')
+
+    # Validation parameters
+    parser.add_argument('--validate', action='store_true', help='Run validation')
+    parser.add_argument('--val_epochs', type=int, default=20, help='Validation frequency')
+    parser.add_argument('--det_epochs', type=int, default=10, help='Detection head training epochs')
 
     parser.add_argument('--output_dir', default='./output_inf_videomae', help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='./output_inf_videomae', help='path where to tensorboard log')
@@ -77,8 +84,6 @@ def get_args_parser():
     return parser
 
 
-# In main_pretrain_infmae.py
-
 def main(args):
     misc.init_distributed_mode(args)
 
@@ -87,39 +92,40 @@ def main(args):
 
     device = torch.device(args.device)
 
-    # --- FIX STARTS HERE ---
-    # Get the rank of the process. This will be 0 for non-distributed training.
+    # Fix random seeds
     global_rank = misc.get_rank()
-
-    # Set seed based on the rank to ensure different initializations for each process
     seed = args.seed + global_rank
-    # --- FIX ENDS HERE ---
-
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    # simple data augmentation
+    # Data augmentation
     transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(args.input_size, scale=(0.5, 1.0), interpolation=3),  # 3 is bicubic
+        transforms.RandomResizedCrop(args.input_size, scale=(0.5, 1.0), interpolation=3),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.425, 0.425, 0.425], std=[0.200, 0.200, 0.200])])
 
-    # Use the new VideoMAEPretrainDataset
-    scene_folders = ['scene_1', 'scene_2', 'scene_3']
+    transform_val = transforms.Compose([
+        transforms.Resize((args.input_size, args.input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.425, 0.425, 0.425], std=[0.200, 0.200, 0.200])])
+
+    # Training dataset
+    train_scene_folders = ['scene_1', 'scene_2', 'scene_3']
     dataset_train = VideoMAEPretrainDataset(
         data_root=args.data_path,
-        scene_folders=scene_folders,
+        scene_folders=train_scene_folders,
         clip_length=args.clip_length,
-        transform=transform_train
+        transform=transform_train,
+        data_ratio=args.data_ratio
     )
-    print(f"Dataset object created: {dataset_train}")
+    print(f"Training dataset: {len(dataset_train)} samples")
 
+    # Data loaders
     if args.distributed:
         num_tasks = misc.get_world_size()
-        # global_rank is already defined
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -127,7 +133,6 @@ def main(args):
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    # Now this check will work correctly in both modes
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.log_dir)
@@ -142,7 +147,7 @@ def main(args):
         drop_last=True,
     )
 
-    # Pass clip_length to the model
+    # Model
     model = models_infmae_skip4.__dict__[args.model](
         norm_pix_loss=args.norm_pix_loss,
         clip_length=args.clip_length
@@ -164,32 +169,85 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr, weight_decay=args.weight_decay,
-                                  betas=(0.9, 0.95))
+    # Optimizer
+    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr,
+                                  weight_decay=args.weight_decay, betas=(0.9, 0.95))
     print(optimizer)
     loss_scaler = NativeScaler()
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
+    # Load checkpoint if resuming
+    if args.resume:
+        misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+    best_recall = 0.0
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-        # In our case, the dataset returns (data, dummy_label)
-        # We need to adapt the train_one_epoch call if it expects a label
+
+        # 确保模型在训练模式
+        model.train()
+
+        # Validation (在训练之前进行，避免影响训练)
+        val_stats = {}
+        if args.validate and epoch % args.val_epochs == 0 and epoch > 0:
+            print("Running validation...")
+
+            # 运行独立的验证过程
+            recall, class_recalls = run_validation_epoch(
+                model_without_ddp, args.data_path, device, args.clip_length,
+                transform_train, transform_val, args.det_epochs, args.data_ratio
+            )
+
+            val_stats = {
+                'val_recall': recall,
+                'val_class_recalls': class_recalls
+            }
+
+            print(f"Validation Results - Overall Recall: {recall:.4f}")
+            for class_id, class_recall in class_recalls.items():
+                class_names = ["drone", "car", "ship", "bus", "pedestrian", "cyclist"]
+                print(f"  {class_names[class_id]}: {class_recall:.4f}")
+
+            # Save best model
+            if recall > best_recall:
+                best_recall = recall
+                if args.output_dir:
+                    misc.save_model(
+                        args=args, epoch=epoch, model=model, model_without_ddp=model_without_ddp,
+                        optimizer=optimizer, loss_scaler=loss_scaler,
+                        filename='best_checkpoint.pth')
+
+        # 确保模型在训练模式
+        model.train()
+
+        # 训练一个epoch
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
+        # *** 修复：每个epoch都保存checkpoint ***
+        if args.output_dir:
+            misc.save_model(
+                args=args, epoch=epoch, model=model, model_without_ddp=model_without_ddp,
+                optimizer=optimizer, loss_scaler=loss_scaler)
+
+            # 额外保存最近的几个epoch
+            if epoch >= args.epochs - 5:  # 保存最后5个epoch
+                misc.save_model(
+                    args=args, epoch=epoch, model=model, model_without_ddp=model_without_ddp,
+                    optimizer=optimizer, loss_scaler=loss_scaler,
+                    filename=f'checkpoint-last-{epoch}.pth')
+
+        # Logging
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     **{f'val_{k}': v for k, v in val_stats.items()},
+                     'epoch': epoch}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:

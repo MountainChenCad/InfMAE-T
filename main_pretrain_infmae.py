@@ -55,11 +55,11 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data_path', default='../InfAIM/dataset', type=str,
                         help='Root path to dataset (containing scene_1, scene_2, etc.)')
-    parser.add_argument('--data_ratio', type=float, default=1.0,
+    parser.add_argument('--data_ratio', type=float, default=0.4,
                         help='Ratio of training data to use (0.0-1.0)')
 
     # Validation parameters
-    parser.add_argument('--validate', action='store_true', help='Run validation')
+    parser.add_argument('--validate', default=True, action='store_true', help='Run validation')
     parser.add_argument('--val_epochs', type=int, default=20, help='Validation frequency')
     parser.add_argument('--det_epochs', type=int, default=10, help='Detection head training epochs')
 
@@ -67,8 +67,8 @@ def get_args_parser():
     parser.add_argument('--log_dir', default='./output_inf_videomae', help='path where to tensorboard log')
     parser.add_argument('--device', default='cuda', help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='start epoch')
+    parser.add_argument('--resume', default='./output_inf_videomae/checkpoint-18.pth', help='resume from checkpoint')
+    parser.add_argument('--start_epoch', default=19, type=int, metavar='N', help='start epoch')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
